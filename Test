@@ -1,0 +1,487 @@
+"""
+Commodity Intelligence Dashboard v2
+Öl • Gold • Weizen + weitere Rohstoffe
+- Live-Preise (Yahoo Finance)
+- Nachrichten + Sentiment
+- Optional LLM-Zusammenfassung (OpenAI-kompatibel)
+- Bereit für Deployment (Streamlit Cloud / Docker)
+"""
+
+import streamlit as st
+import feedparser
+import requests
+import yfinance as yf
+from datetime import datetime, timedelta
+from textblob import TextBlob
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
+
+# -----------------------------
+# Seiten-Konfiguration
+# -----------------------------
+st.set_page_config(
+    page_title="Commodity Intelligence Dashboard",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# -----------------------------
+# Konfiguration & Konstanten
+# -----------------------------
+# Yahoo Finance Tickers (Futures)
+COMMODITIES = {
+    "Energie": {
+        "WTI Crude Oil": "CL=F",
+        "Brent Crude": "BZ=F",
+        "Natural Gas": "NG=F",
+        "Heating Oil": "HO=F",
+        "RBOB Gasoline": "RB=F",
+    },
+    "Edelmetalle": {
+        "Gold": "GC=F",
+        "Silver": "SI=F",
+        "Platinum": "PL=F",
+        "Palladium": "PA=F",
+    },
+    "Industriemetalle": {
+        "Copper": "HG=F",
+        "Aluminum": "ALI=F",  # kann unzuverlässig sein
+    },
+    "Agrar": {
+        "Wheat": "ZW=F",
+        "Corn": "ZC=F",
+        "Soybeans": "ZS=F",
+        "Soybean Oil": "ZL=F",
+        "Coffee": "KC=F",
+        "Sugar": "SB=F",
+        "Cotton": "CT=F",
+        "Cocoa": "CC=F",
+    },
+}
+
+# RSS-Feeds (kostenlos)
+NEWS_FEEDS = {
+    "Öl / Energie": [
+        "https://oilprice.com/rss/main",
+        "https://news.google.com/rss/search?q=(oil+price+OR+crude+oil+OR+Brent+OR+WTI+OR+OPEC+OR+%22natural+gas%22)+when:2d&hl=en-US&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=site:reuters.com+(oil+OR+crude+OR+energy+OR+OPEC)+when:2d&hl=en-US&gl=US&ceid=US:en",
+    ],
+    "Gold / Metalle": [
+        "https://news.google.com/rss/search?q=(gold+price+OR+silver+price+OR+copper+OR+platinum+OR+%22precious+metals%22)+when:2d&hl=en-US&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=site:kitco.com+(gold+OR+silver)+when:2d&hl=en-US&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=site:reuters.com+(gold+OR+silver+OR+metals)+when:2d&hl=en-US&gl=US&ceid=US:en",
+    ],
+    "Weizen / Agrar": [
+        "https://news.google.com/rss/search?q=(wheat+OR+corn+OR+soybean+OR+grain)+price+OR+commodity+when:3d&hl=en-US&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=site:reuters.com+(wheat+OR+grain+OR+corn)+when:3d&hl=en-US&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=(Weizen+OR+Getreide+OR+Mais)+Preis+OR+Ernte+when:3d&hl=de&gl=DE&ceid=DE:de",
+    ],
+}
+
+BULLISH_KEYWORDS = [
+    "surge", "rally", "jump", "rise", "higher", "gain", "bullish", "tight", "shortage",
+    "supply concern", "geopolitical", "war", "sanction", "demand", "record high", "soar",
+    "steigt", "knappheit", "krieg", "sanktion", "nachfrage", "anstieg", "rallye", "engpass"
+]
+
+BEARISH_KEYWORDS = [
+    "fall", "drop", "decline", "lower", "bearish", "surplus", "glut", "weak", "slump",
+    "recession", "demand weak", "inventory high", "production increase", "ceasefire", "plunge",
+    "fällt", "rückgang", "überschuss", "schwach", "sinkt", "preisdruck", "lager"
+]
+
+
+# -----------------------------
+# Hilfsfunktionen
+# -----------------------------
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def get_sentiment_score(text: str) -> float:
+    if not text:
+        return 0.0
+    text_lower = text.lower()
+    bull = sum(1 for kw in BULLISH_KEYWORDS if kw in text_lower)
+    bear = sum(1 for kw in BEARISH_KEYWORDS if kw in text_lower)
+    keyword_score = (bull - bear) / max(bull + bear, 1)
+    try:
+        tb_score = TextBlob(text).sentiment.polarity
+    except Exception:
+        tb_score = 0.0
+    final = 0.55 * keyword_score + 0.45 * tb_score
+    return max(min(final, 1.0), -1.0)
+
+
+def bias_label(score: float) -> tuple[str, str]:
+    if score > 0.22:
+        return "Bullisch ↗", "#22c55e"
+    elif score < -0.22:
+        return "Bearisch ↘", "#ef4444"
+    return "Neutral →", "#94a3b8"
+
+
+def probability_from_score(score: float) -> dict:
+    bull = int(50 + score * 38)
+    bull = max(12, min(88, bull))
+    return {"bullisch": bull, "bearisch": 100 - bull}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_prices():
+    """Holt aktuelle Preise und Tagesveränderung für alle Commodities."""
+    results = {}
+    all_tickers = []
+    ticker_to_name = {}
+    for category, items in COMMODITIES.items():
+        for name, ticker in items.items():
+            all_tickers.append(ticker)
+            ticker_to_name[ticker] = (category, name)
+            if category not in results:
+                results[category] = {}
+            results[category][name] = {"ticker": ticker, "price": None, "change_pct": None}
+
+    # Einzelne Ticker nacheinander (stabiler auf Streamlit Cloud)
+    for ticker in all_tickers:
+        category, name = ticker_to_name[ticker]
+        try:
+            t = yf.Ticker(ticker)
+            hist = t.history(period="5d")
+            if hist is not None and not hist.empty and "Close" in hist.columns:
+                close = hist["Close"].dropna()
+                if len(close) >= 1:
+                    price = float(close.iloc[-1])
+                    change_pct = None
+                    if len(close) >= 2:
+                        prev = float(close.iloc[-2])
+                        if prev != 0:
+                            change_pct = ((price - prev) / prev) * 100
+                    results[category][name] = {
+                        "ticker": ticker,
+                        "price": price,
+                        "change_pct": change_pct,
+                    }
+        except Exception:
+            # Ticker überspringen, App soll nicht abstürzen
+            continue
+
+    return results
+
+
+def fetch_single_feed(url: str, max_entries: int = 8):
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; CommodityDashboard/2.0)"}
+        resp = requests.get(url, headers=headers, timeout=10)
+        feed = feedparser.parse(resp.content)
+        entries = []
+        for entry in feed.entries[:max_entries]:
+            title = clean_text(entry.get("title", ""))
+            summary = clean_text(entry.get("summary", entry.get("description", "")))
+            if len(title) < 12:
+                continue
+            entries.append({
+                "title": title,
+                "summary": summary[:350] + ("..." if len(summary) > 350 else ""),
+                "link": entry.get("link", ""),
+                "published": entry.get("published", entry.get("updated", "")),
+                "score": get_sentiment_score(title + " " + summary),
+            })
+        return entries
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_news():
+    results = {}
+    for category, urls in NEWS_FEEDS.items():
+        all_entries = []
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(fetch_single_feed, url) for url in urls]
+            for future in as_completed(futures):
+                all_entries.extend(future.result())
+
+        # Deduplizieren
+        seen = set()
+        unique = []
+        for e in all_entries:
+            key = e["title"][:70].lower()
+            if key not in seen:
+                seen.add(key)
+                unique.append(e)
+        unique.sort(key=lambda x: abs(x["score"]), reverse=True)
+        results[category] = unique[:18]
+    return results
+
+
+def call_llm(api_key: str, base_url: str, model: str, headlines: list[str], commodity: str) -> str:
+    """Ruft ein OpenAI-kompatibles LLM auf (OpenAI, xAI/Grok, Together, etc.)."""
+    if not api_key or not headlines:
+        return ""
+
+    prompt = f"""Du bist ein erfahrener Rohstoff-Analyst.
+Fasse die folgenden aktuellen Nachrichten zu {commodity} in 4-6 klaren, neutralen Sätzen zusammen.
+Hebe die wichtigsten Treiber (Angebot, Nachfrage, Geopolitik, Wetter, Lagerbestände) hervor.
+Gib am Ende eine kurze Einschätzung der aktuellen Stimmung (bullisch / neutral / bearisch) und warum.
+Antworte auf Deutsch.
+
+Nachrichten:
+{chr(10).join(f"- {h}" for h in headlines[:12])}
+"""
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "Du bist ein präziser, nüchterner Rohstoff-Analyst. Keine Anlageberatung."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 500,
+    }
+
+    try:
+        resp = requests.post(
+            f"{base_url.rstrip('/')}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        else:
+            return f"LLM-Fehler ({resp.status_code}): {resp.text[:200]}"
+    except Exception as e:
+        return f"LLM-Verbindungsfehler: {e}"
+
+
+# -----------------------------
+# Sidebar – Einstellungen & LLM
+# -----------------------------
+with st.sidebar:
+    st.title("⚙️ Einstellungen")
+
+    st.subheader("LLM-Zusammenfassung (optional)")
+
+    # --- Secrets aus Streamlit Cloud laden (falls vorhanden) ---
+    secret_key = ""
+    secret_base_url = "https://api.openai.com/v1"
+    secret_model = "gpt-4o-mini"
+    secret_provider = "OpenAI"
+
+    try:
+        if "LLM_API_KEY" in st.secrets:
+            secret_key = st.secrets["LLM_API_KEY"]
+        if "LLM_BASE_URL" in st.secrets:
+            secret_base_url = st.secrets["LLM_BASE_URL"]
+        if "LLM_MODEL" in st.secrets:
+            secret_model = st.secrets["LLM_MODEL"]
+        if "LLM_PROVIDER" in st.secrets:
+            secret_provider = st.secrets["LLM_PROVIDER"]
+    except Exception:
+        pass  # Lokal oder keine Secrets → ignorieren
+
+    has_secret = bool(secret_key)
+
+    if has_secret:
+        st.success("LLM-Key aus Secrets geladen ✓")
+        use_llm = st.toggle("LLM aktivieren", value=True)
+        api_key = secret_key
+        base_url = secret_base_url
+        model = secret_model
+        st.caption(f"Provider: {secret_provider} | Modell: {model}")
+    else:
+        use_llm = st.toggle("LLM aktivieren", value=False, help="Benötigt einen API-Key (OpenAI, xAI, Together etc.)")
+        api_key = ""
+        base_url = "https://api.openai.com/v1"
+        model = "gpt-4o-mini"
+
+        if use_llm:
+            api_key = st.text_input("API-Key", type="password", help="Wird nur lokal verwendet und nicht gespeichert")
+            provider = st.selectbox(
+                "Provider",
+                ["OpenAI", "xAI (Grok)", "Together AI", "Custom"],
+                index=0
+            )
+            if provider == "OpenAI":
+                base_url = "https://api.openai.com/v1"
+                model = st.selectbox("Modell", ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"], index=0)
+            elif provider == "xAI (Grok)":
+                base_url = "https://api.x.ai/v1"
+                model = st.selectbox("Modell", ["grok-3", "grok-3-mini", "grok-2"], index=0)
+            elif provider == "Together AI":
+                base_url = "https://api.together.xyz/v1"
+                model = st.text_input("Modell", value="meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo")
+            else:
+                base_url = st.text_input("Base URL", value="https://api.openai.com/v1")
+                model = st.text_input("Modell", value="gpt-4o-mini")
+
+    st.markdown("---")
+    if st.button("🔄 Alles neu laden", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    st.markdown("---")
+    st.caption("Datenquellen")
+    st.caption("• Preise: Yahoo Finance (Futures)")
+    st.caption("• News: OilPrice, Google News, Reuters (RSS)")
+    st.caption("• Sentiment: Keywords + TextBlob")
+    st.caption("• LLM: optional (dein Key / Secrets)")
+
+    st.markdown("---")
+    st.markdown("### Teilen / Deployen")
+    st.markdown("""
+    1. Code auf GitHub pushen  
+    2. Bei [share.streamlit.io](https://share.streamlit.io) deployen  
+    3. API-Key als Secret hinterlegen (optional)  
+    4. Link mit anderen teilen
+    """)
+
+
+# -----------------------------
+# Hauptbereich
+# -----------------------------
+st.title("📊 Commodity Intelligence Dashboard")
+st.caption(f"Live-Preise • Nachrichten • Sentiment • optional LLM  |  Stand: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+
+st.info(
+    "**Kein finanzieller Rat.** Die dargestellten Scores und Zusammenfassungen sind **keine Handelsempfehlungen**. "
+    "Rohstoffmärkte sind volatil und Nachrichten können irreführend sein."
+)
+
+# 1. Live-Preise
+st.header("💰 Aktuelle Preise (Futures)")
+
+try:
+    with st.spinner("Lade Preisdaten..."):
+        price_data = fetch_prices()
+except Exception as e:
+    st.error(f"Fehler beim Laden der Preise: {e}")
+    price_data = {}
+    st.info("Klicke in der Sidebar auf „Alles neu laden“ oder warte 30 Sekunden und lade die Seite neu.")
+
+# Schöne Karten pro Kategorie
+for category, items in price_data.items():
+    st.subheader(category)
+    cols = st.columns(min(4, len(items)))
+    for idx, (name, info) in enumerate(items.items()):
+        with cols[idx % len(cols)]:
+            price = info["price"]
+            change = info["change_pct"]
+            if price is None:
+                st.metric(name, "–", "keine Daten")
+            else:
+                delta_str = f"{change:+.2f}%" if change is not None else None
+                st.metric(
+                    label=name,
+                    value=f"{price:,.2f}",
+                    delta=delta_str,
+                    delta_color="normal"
+                )
+
+st.markdown("---")
+
+# 2. News + Sentiment + optional LLM
+st.header("📰 Nachrichten & Stimmung")
+
+try:
+    with st.spinner("Lade Nachrichten..."):
+        news_data = load_news()
+except Exception as e:
+    st.error(f"Fehler beim Laden der Nachrichten: {e}")
+    news_data = {}
+    st.info("Klicke in der Sidebar auf „Alles neu laden“.")
+
+tabs = st.tabs(list(NEWS_FEEDS.keys()))
+
+for tab, category in zip(tabs, NEWS_FEEDS.keys()):
+    with tab:
+        entries = news_data.get(category, [])
+        if not entries:
+            st.warning("Keine aktuellen Nachrichten gefunden.")
+            continue
+
+        # Durchschnittlicher Sentiment-Score
+        avg_score = sum(e["score"] for e in entries) / len(entries)
+        label, color = bias_label(avg_score)
+        probs = probability_from_score(avg_score)
+
+        # Bias-Übersicht
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            st.markdown(
+                f"""
+                <div style="background:#1e293b;border-radius:12px;padding:1rem 1.2rem;border-left:5px solid {color};">
+                    <span style="font-size:1.3rem;font-weight:700;color:{color};">{label}</span>
+                    <span style="color:#94a3b8;margin-left:1rem;">Score {avg_score:+.2f}</span>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+        with c2:
+            st.metric("Bullisch (illustrativ)", f"{probs['bullisch']}%")
+        with c3:
+            st.metric("Bearisch (illustrativ)", f"{probs['bearisch']}%")
+
+        # LLM-Zusammenfassung
+        if use_llm and api_key:
+            with st.expander("🤖 LLM-Zusammenfassung", expanded=True):
+                if st.button(f"Zusammenfassung für {category} generieren", key=f"llm_{category}"):
+                    with st.spinner("LLM denkt nach..."):
+                        headlines = [e["title"] for e in entries[:12]]
+                        summary = call_llm(api_key, base_url, model, headlines, category)
+                        st.session_state[f"summary_{category}"] = summary
+
+                if f"summary_{category}" in st.session_state:
+                    st.markdown(st.session_state[f"summary_{category}"])
+        elif use_llm and not api_key:
+            st.warning("Bitte API-Key in der Sidebar eingeben, um LLM-Zusammenfassungen zu nutzen.")
+
+        st.markdown("#### Schlagzeilen")
+        for entry in entries:
+            score = entry["score"]
+            lbl, col = bias_label(score)
+            with st.container():
+                col_a, col_b = st.columns([6, 1])
+                with col_a:
+                    st.markdown(f"**[{entry['title']}]({entry['link']})**")
+                    if entry["summary"]:
+                        st.caption(entry["summary"])
+                    if entry["published"]:
+                        st.caption(f"🕒 {entry['published']}")
+                with col_b:
+                    st.markdown(
+                        f"""
+                        <div style="background:{col}22;border:1px solid {col};border-radius:8px;
+                                    padding:0.35rem 0.5rem;text-align:center;color:{col};
+                                    font-weight:600;font-size:0.8rem;">
+                            {lbl}<br><span style="font-size:0.7rem;">{score:+.2f}</span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+                st.divider()
+
+# Footer
+st.markdown("---")
+st.caption(
+    "Dieses Dashboard ist ein Open-Source-Prototyp. "
+    "Preise: Yahoo Finance • News: öffentliche RSS-Feeds • "
+    "Keine Anlageberatung. Nutzung auf eigene Verantwortung."
+)
+streamlit>=1.32.0
+feedparser>=6.0.11
+requests>=2.31.0
+textblob>=0.18.0
+yfinance>=0.2.40
+openai>=1.30.0

@@ -479,9 +479,3 @@ st.caption(
     "Preise: Yahoo Finance • News: öffentliche RSS-Feeds • "
     "Keine Anlageberatung. Nutzung auf eigene Verantwortung."
 )
-streamlit>=1.32.0
-feedparser>=6.0.11
-requests>=2.31.0
-textblob>=0.18.0
-yfinance>=0.2.40
-openai>=1.30.0
